@@ -8,6 +8,7 @@ from lake.book.adjustments import WithdrawalAdjustment, read_adjustment
 from lake.intake.provenance import require_identifier
 from lake.mirror.transactions import mirror_read
 from lake.release.formats import Document
+from lake.release.issues import read_original_merge
 from lake.release.parts import read_original_parts
 from lake.release.withdrawals import read_original_withdrawal
 
@@ -30,9 +31,11 @@ def replay(db: sqlite3.Connection, number: str) -> HistoryRecord:
             documents = read_original_parts(db, number)
         elif receipt.kind == 'withdraw_issue':
             documents = (read_original_withdrawal(db, number),)
-        elif receipt.kind == 'withdraw':
+        elif receipt.kind == 'merge_issue':
+            documents = (read_original_merge(db, number),)
+        elif receipt.kind in ('withdraw', 'merge'):
             adjustment = read_adjustment(db, receipt.details['adjustment_id'])
             if adjustment is None:
-                raise sqlite3.DatabaseError('withdrawal receipt lacks its adjustment')
+                raise sqlite3.DatabaseError('settlement receipt lacks its adjustment')
         origins = read_receipt_origins(db, receipt, adjustment=adjustment)
         return HistoryRecord(receipt, origins, documents, adjustment)

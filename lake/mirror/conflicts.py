@@ -2,7 +2,7 @@ import sqlite3
 
 from lake.audit.requests import RequestConflict, check_request
 from lake.mirror.evidence import read_known_fact
-from lake.release.formats import Document, PublicationPart, encode_document
+from lake.release.formats import Document, MergeCorrection, PublicationPart, encode_document
 
 
 class DocumentConflict(RequestConflict):
@@ -23,3 +23,11 @@ def validate_fact_consistency(db: sqlite3.Connection, part: PublicationPart) -> 
         known = read_known_fact(db, fact.fact_id)
         if known is not None and known != fact:
             raise DocumentConflict(f'conflicting fields for frozen fact {fact.fact_id}')
+
+
+def validate_merge_consistency(db: sqlite3.Connection, correction: MergeCorrection) -> None:
+    known = read_known_fact(db, correction.replacement.fact_id)
+    if known is not None and known != correction.replacement:
+        raise DocumentConflict(
+            f'conflicting fields for frozen fact {correction.replacement.fact_id}')
+

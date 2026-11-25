@@ -18,10 +18,10 @@ def snapshot_origins(facts: Iterable[FactOrigin]) -> dict[str, dict[str, str]]:
 def read_receipt_origins(
     db: sqlite3.Connection, receipt: Receipt, *, adjustment: WithdrawalAdjustment | None = None,
 ) -> dict[str, dict[str, str]]:
-    if receipt.kind != 'withdraw':
+    if receipt.kind not in ('withdraw', 'merge'):
         return receipt.origins
     if adjustment is None:
         adjustment = read_adjustment(db, receipt.details['adjustment_id'])
     if adjustment is None:
-        raise sqlite3.DatabaseError('withdrawal receipt lacks its adjustment')
-    return snapshot_origins(adjustment.removed)
+        raise sqlite3.DatabaseError('settlement receipt lacks its adjustment')
+    return snapshot_origins(adjustment.removed + adjustment.added)

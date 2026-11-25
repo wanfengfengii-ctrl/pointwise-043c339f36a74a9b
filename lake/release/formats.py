@@ -38,7 +38,19 @@ class WithdrawalNotice:
         return self.notice_id
 
 
-Document = PublicationPart | WithdrawalNotice
+@dataclass(frozen=True)
+class MergeCorrection:
+    correction_id: str
+    publication_id: str
+    old_ids: tuple[str, str]
+    replacement: PartFact
+
+    @property
+    def number(self) -> str:
+        return self.correction_id
+
+
+Document = PublicationPart | WithdrawalNotice | MergeCorrection
 
 
 def part_number(publication_id: str, position: int) -> str:
@@ -85,11 +97,31 @@ def _notice_fields(notice: WithdrawalNotice) -> dict:
     }
 
 
+def _correction_fields(correction: MergeCorrection) -> dict:
+    correction_id = require_identifier(correction.correction_id, 'correction number')
+    publication_id = require_identifier(correction.publication_id, 'publication number')
+    if not isinstance(correction.old_ids, tuple) or len(correction.old_ids) != 2:
+        raise ValueError('expected exactly two ordered original fact numbers')
+    old_ids = tuple(require_identifier(number, 'fact number') for number in correction.old_ids)
+    if old_ids[0] == old_ids[1]:
+        raise ValueError('duplicate original fact within correction')
+    replacement = _fact_fields(correction.replacement)
+    if correction.replacement.fact_id in old_ids:
+        raise ValueError('the review row repeats an original fact')
+    return {
+        'version': 1, 'kind': 'merge', 'correction_id': correction_id,
+        'publication_id': publication_id, 'old_ids': list(old_ids),
+        'replacement': replacement,
+    }
+
+
 def encode_document(document: Document) -> str:
     if isinstance(document, PublicationPart):
         return canonical_content(_part_fields(document))
     if isinstance(document, WithdrawalNotice):
         return canonical_content(_notice_fields(document))
+    if isinstance(document, MergeCorrection):
+        return canonical_content(_correction_fields(document))
     raise ValueError('unsupported publication document')
 
 
@@ -135,4 +167,14 @@ def decode_document(payload: str | bytes) -> Document:
         notice = WithdrawalNotice(fields['notice_id'], fields['publication_id'], fields['scope'])
         _notice_fields(notice)
         return notice
+    if fields.get('kind') == 'merge':
+        _fields(fields, {'version', 'kind', 'correction_id', 'publication_id', 'old_ids', 'replacement'})
+        if type(fields['old_ids']) is not list:
+            raise ValueError('invalid original fact list')
+        correction = MergeCorrection(
+            fields['correction_id'], fields['publication_id'],
+            tuple(fields['old_ids']), _decode_fact(fields['replacement']),
+        )
+        _correction_fields(correction)
+        return correction
     raise ValueError('unknown document kind')

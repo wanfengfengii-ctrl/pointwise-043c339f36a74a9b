@@ -8,11 +8,14 @@ from lake.book.adjustments import WithdrawalAdjustment, compute_adjustment, prep
 from lake.book.facts import prepare_fact_book, read_current_facts, replace_current_facts
 from lake.book.stations import prepare_station_register, register_station, seed_stations
 from lake.intake.rows import litres_text
-from lake.mirror.conflicts import DocumentConflict, classify_document, validate_fact_consistency
+from lake.mirror.conflicts import DocumentConflict, classify_document, validate_fact_consistency, validate_merge_consistency
 from lake.mirror.eligibility import is_publication_withdrawn, mark_publication_withdrawn, prepare_eligibility_store
-from lake.mirror.evidence import list_active_facts, prepare_evidence_store, record_received_part
+from lake.mirror.evidence import (
+    has_received_fact_from, list_active_facts, list_paused_fact_ids, prepare_evidence_store,
+    prepare_merge_store, record_merge, record_received_part,
+)
 from lake.mirror.transactions import mirror_write
-from lake.release.formats import Document, PublicationPart, WithdrawalNotice, decode_document
+from lake.release.formats import Document, MergeCorrection, PublicationPart, WithdrawalNotice, decode_document
 
 
 @dataclass(frozen=True)
@@ -29,6 +32,7 @@ def initialize_mirror(db: sqlite3.Connection, stations=()) -> None:
         prepare_station_register(db)
         prepare_eligibility_store(db)
         prepare_evidence_store(db)
+        prepare_merge_store(db)
         prepare_fact_book(db)
         prepare_adjustment_store(db)
         seed_stations(db, stations)
@@ -38,10 +42,22 @@ def _replay_acceptance(db: sqlite3.Connection, receipt_id: str) -> AcceptanceRes
     receipt = require_receipt(db, receipt_id)
     if receipt.kind == 'receive':
         return AcceptanceResult('received', receipt)
+    if receipt.kind != 'withdraw':
+        raise sqlite3.DatabaseError(f'unexpected acceptance receipt kind {receipt.kind}')
     adjustment = read_adjustment(db, receipt_id)
     if adjustment is None:
         raise sqlite3.DatabaseError('withdrawal receipt lacks its settlement')
     return AcceptanceResult('withdrawn', receipt, adjustment)
+
+
+def _replay_merge(db: sqlite3.Connection, receipt_id: str) -> AcceptanceResult:
+    receipt = require_receipt(db, receipt_id)
+    if receipt.kind != 'merge':
+        raise sqlite3.DatabaseError(f'unexpected merge receipt kind {receipt.kind}')
+    adjustment = read_adjustment(db, receipt.details['adjustment_id'])
+    if adjustment is None:
+        raise sqlite3.DatabaseError('merge receipt lacks its settlement')
+    return AcceptanceResult('merged', receipt, adjustment)
 
 
 def _receive_part(db: sqlite3.Connection, part: PublicationPart) -> AcceptanceResult:
@@ -50,6 +66,7 @@ def _receive_part(db: sqlite3.Connection, part: PublicationPart) -> AcceptanceRe
         return AcceptanceResult('late')
 
     before = {fact.fact_id for fact in read_current_facts(db)}
+    paused = list_paused_fact_ids(db)
     for station in sorted({fact.station for fact in part.facts}):
         register_station(db, station)
     receipt = Receipt(
@@ -59,7 +76,10 @@ def _receive_part(db: sqlite3.Connection, part: PublicationPart) -> AcceptanceRe
                 {'fact_id': fact.fact_id, 'station': fact.station, 'litres': litres_text(fact.litres)}
                 for fact in part.facts
             ],
-            'added_fact_ids': [fact.fact_id for fact in part.facts if fact.fact_id not in before],
+            'added_fact_ids': [
+                fact.fact_id for fact in part.facts
+                if fact.fact_id not in before and fact.fact_id not in paused
+            ],
         },
         snapshot_origins(part.facts),
     )
@@ -84,11 +104,41 @@ def _settle_withdrawal(db: sqlite3.Connection, notice: WithdrawalNotice) -> Acce
     return AcceptanceResult('withdrawn', receipt, adjustment)
 
 
+def _settle_merge(db: sqlite3.Connection, correction: MergeCorrection) -> AcceptanceResult:
+    validate_merge_consistency(db, correction)
+    if is_publication_withdrawn(db, correction.publication_id):
+        return AcceptanceResult('late')
+    if not all(
+        has_received_fact_from(db, correction.publication_id, number) for number in correction.old_ids
+    ):
+        return AcceptanceResult('pending')
+    before = read_current_facts(db)
+    register_station(db, correction.replacement.station)
+    receipt = Receipt(
+        correction.correction_id, 'merge',
+        {
+            'publication_id': correction.publication_id,
+            'adjustment_id': correction.correction_id,
+            'old_ids': list(correction.old_ids),
+            'replacement_id': correction.replacement.fact_id,
+        },
+        {},
+    )
+    save_receipt(db, receipt)
+    record_merge(db, correction, receipt.receipt_id)
+    after = replace_current_facts(db, list_active_facts(db))
+    adjustment = compute_adjustment(correction.correction_id, correction.publication_id, before, after)
+    save_adjustment(db, adjustment)
+    return AcceptanceResult('merged', receipt, adjustment)
+
+
 def accept(
     db: sqlite3.Connection, document: Document | str | bytes, *, fail_before_commit: bool = False,
 ) -> AcceptanceResult:
     if isinstance(document, (str, bytes)):
         document = decode_document(document)
+    if not isinstance(document, (PublicationPart, WithdrawalNotice)):
+        raise ValueError('unsupported acceptance document')
     with mirror_write(db, fail_before_commit=fail_before_commit):
         content, previous = classify_document(db, document)
         if previous is not None:
@@ -97,6 +147,23 @@ def accept(
             result = _receive_part(db, document)
         else:
             result = _settle_withdrawal(db, document)
+        if result.receipt is not None:
+            bind_request(db, 'delivery', document.number, content, result.receipt.receipt_id)
+        return result
+
+
+def apply_merge(
+    db: sqlite3.Connection, document: Document | str | bytes, *, fail_before_commit: bool = False,
+) -> AcceptanceResult:
+    if isinstance(document, (str, bytes)):
+        document = decode_document(document)
+    if not isinstance(document, MergeCorrection):
+        raise ValueError('expected a merge correction document')
+    with mirror_write(db, fail_before_commit=fail_before_commit):
+        content, previous = classify_document(db, document)
+        if previous is not None:
+            return _replay_merge(db, previous)
+        result = _settle_merge(db, document)
         if result.receipt is not None:
             bind_request(db, 'delivery', document.number, content, result.receipt.receipt_id)
         return result
